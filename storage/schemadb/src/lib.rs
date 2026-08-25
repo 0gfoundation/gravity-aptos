@@ -34,13 +34,39 @@ use aptos_metrics_core::TimerHelper;
 use aptos_storage_interface::{AptosDbError, Result as DbResult};
 use batch::{IntoRawBatch, NativeBatch, WriteBatch};
 use iterator::{ScanDirection, SchemaIterator};
+use once_cell::sync::Lazy;
 use rocksdb::ErrorKind;
 /// Type alias to `rocksdb::ReadOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
 pub use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Options, ReadOptions,
     SliceTransform, DEFAULT_COLUMN_FAMILY_NAME,
 };
-use std::{collections::HashSet, fmt::Debug, iter::Iterator, path::Path};
+use std::{
+    collections::HashSet,
+    fmt::Debug,
+    iter::Iterator,
+    path::Path,
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+/// When set (`APTOS_SCHEMADB_ASYNC_WAL=1`), batch commits skip the per-write WAL fsync and a
+/// background anchor fsyncs the WAL every `APTOS_SCHEMADB_WAL_SYNC_INTERVAL_MS` (default 1000)
+/// instead, bounding the crash-loss window to one interval. The WAL itself is still written on
+/// every commit, so a process crash loses nothing — only power loss / kernel panic can lose the
+/// tail. Consensus safety data (last vote, preferred round) lives in the separate
+/// secure-storage file, NOT in schemadb, so this never risks equivocation; blocks/QCs/batches
+/// inside the window are recoverable from peers (or, single-validator, re-proposed).
+static ASYNC_WAL: Lazy<bool> = Lazy::new(|| {
+    std::env::var("APTOS_SCHEMADB_ASYNC_WAL").map_or(false, |v| v == "1" || v == "true")
+});
+
+static WAL_SYNC_INTERVAL_MS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("APTOS_SCHEMADB_WAL_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+});
 
 pub type ColumnFamilyName = &'static str;
 
@@ -56,7 +82,7 @@ enum OpenMode<'a> {
 #[derive(Debug)]
 pub struct DB {
     name: String, // for logging
-    inner: rocksdb::DB,
+    inner: Arc<rocksdb::DB>,
 }
 
 impl DB {
@@ -177,10 +203,40 @@ impl DB {
             open_mode = ?open_mode,
             "Opened RocksDB."
         );
+        let inner = Arc::new(inner);
+        if *ASYNC_WAL && matches!(open_mode, OpenMode::ReadWrite) {
+            Self::spawn_wal_sync_anchor(name.to_string(), Arc::downgrade(&inner));
+        }
         DB {
             name: name.to_string(),
             inner,
         }
+    }
+
+    /// Periodically fsyncs the WAL while commits run unsynced (see [`ASYNC_WAL`]). Holds only a
+    /// Weak ref so dropping the DB ends the anchor; rocksdb's flush_wal is thread-safe against
+    /// concurrent writes (unlike an external sync on mdbx, which raced them).
+    fn spawn_wal_sync_anchor(name: String, db: Weak<rocksdb::DB>) {
+        let interval = Duration::from_millis(*WAL_SYNC_INTERVAL_MS);
+        info!(
+            rocksdb_name = name,
+            interval_ms = *WAL_SYNC_INTERVAL_MS,
+            "schemadb async WAL enabled; starting periodic WAL sync anchor."
+        );
+        std::thread::Builder::new()
+            .name(format!("wal-sync-{name}"))
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                match db.upgrade() {
+                    Some(db) => {
+                        if let Err(e) = db.flush_wal(true /* sync */) {
+                            warn!(rocksdb_name = name, error = ?e, "WAL sync anchor flush failed");
+                        }
+                    },
+                    None => return,
+                }
+            })
+            .expect("failed to spawn schemadb WAL sync anchor");
     }
 
     /// Reads single record by key.
@@ -325,12 +381,12 @@ impl Drop for DB {
     }
 }
 
-/// For now we always use synchronous writes. This makes sure that once the operation returns
-/// `Ok(())` the data is persisted even if the machine crashes. In the future we might consider
-/// selectively turning this off for some non-critical writes to improve performance.
+/// Synchronous writes by default: once the operation returns `Ok(())` the data survives a
+/// machine crash. Under `APTOS_SCHEMADB_ASYNC_WAL=1` the per-write fsync is skipped and the
+/// periodic WAL sync anchor bounds the loss window instead (see [`ASYNC_WAL`]).
 fn default_write_options() -> rocksdb::WriteOptions {
     let mut opts = rocksdb::WriteOptions::default();
-    opts.set_sync(true);
+    opts.set_sync(!*ASYNC_WAL);
     opts
 }
 
