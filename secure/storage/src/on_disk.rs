@@ -24,6 +24,7 @@ use std::{
 /// in production.
 pub struct OnDiskStorage {
     file_path: PathBuf,
+    file_dir: PathBuf,
     temp_path: TempPath,
     time_service: TimeService,
 }
@@ -48,7 +49,8 @@ impl OnDiskStorage {
 
         Self {
             file_path,
-            temp_path: TempPath::new_with_temp_dir(file_dir),
+            temp_path: TempPath::new_with_temp_dir(file_dir.clone()),
+            file_dir,
             time_service,
         }
     }
@@ -65,11 +67,38 @@ impl OnDiskStorage {
         Ok(data)
     }
 
+    /// Atomically and durably replaces the file contents. This file holds consensus safety data
+    /// (e.g. last_voted_round); if a write could be lost on power failure, a restarted validator
+    /// might sign a vote conflicting with one it already sent. So the new contents are written to
+    /// a temp file in the same directory and fsynced, renamed over the target (atomic, so readers
+    /// never see a partial file), and then the directory is fsynced so the rename itself survives
+    /// a crash.
     fn write(&self, data: &HashMap<String, Value>) -> Result<(), Error> {
         let contents = serde_json::to_vec(data)?;
         let mut file = File::create(self.temp_path.path())?;
         file.write_all(&contents)?;
+        file.sync_all()?;
+        drop(file);
         fs::rename(&self.temp_path, &self.file_path)?;
+        self.sync_dir()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn sync_dir(&self) -> Result<(), Error> {
+        // An empty parent means the file lives in the current working directory.
+        let dir = if self.file_dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            self.file_dir.as_path()
+        };
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Directories cannot be opened for fsync on non-unix platforms; the rename is still atomic.
+    #[cfg(not(unix))]
+    fn sync_dir(&self) -> Result<(), Error> {
         Ok(())
     }
 }
